@@ -8,16 +8,18 @@ SILENT REQUIEM — бот приёма анкет в клан.
 4. Уровень / лвл (минимум 40)
 5. Часовой пояс (ЧП)
 
-Готовая анкета уходит модератору (MODERATOR_ID) с кнопками
-«✅ Принять» / «❌ Отклонить». По нажатию:
-- заявителю приходит уведомление о решении (при одобрении — ссылка на чат
-  клана, если задан CLAN_INVITE_LINK);
-- решение и сама анкета сохраняются в историю (data/anketa_history.json).
+Готовая анкета уходит СРАЗУ ВСЕМ модераторам (MODERATOR_IDS) — каждому
+отдельным сообщением с кнопками «✅ Принять» / «❌ Отклонить». Решение
+принимает тот, кто нажал кнопку первым:
+- у всех остальных модераторов их копии сообщения автоматически
+  обновляются («уже обработано модератором Х»), повторно нажать нельзя;
+- заявителю приходит уведомление о решении (при одобрении — ссылка на
+  чат клана, если задан CLAN_INVITE_LINK);
+- анкета и решение сохраняются в историю (data/anketa_history.json).
 
-Команда /history показывает историю всех анкет и доступна ТОЛЬКО
-модератору (MODERATOR_ID) — остальным бот вежливо откажет. Более того,
-в меню команд Telegram эта команда видна только в чате с модератором
-(остальным пользователям она не отображается в автодополнении).
+Команда /history показывает историю всех анкет и доступна ЛЮБОМУ
+модератору из MODERATOR_IDS — остальным бот вежливо откажет. В меню
+команд Telegram эта команда видна только в чатах с модераторами.
 
 UX:
 - Внизу экрана постоянная reply-клавиатура с кнопкой «📋 Оставить анкету».
@@ -26,7 +28,7 @@ UX:
   начнётся заново (старый прогресс сбрасывается).
 
 История анкет хранится в JSON-файле на диске (переживает перезапуск
-бота), поэтому даже уже отправленные модератору анкеты с кнопками
+бота), поэтому даже уже отправленные модераторам анкеты с кнопками
 «Принять/Отклонить» продолжают работать после рестарта бота.
 """
 
@@ -54,7 +56,7 @@ from aiogram.types import (
 import storage
 from config import (
     BOT_TOKEN_ANKETA,
-    MODERATOR_ID,
+    MODERATOR_IDS,
     CLAN_NAME,
     CLAN_INVITE_LINK,
     MIN_AGE,
@@ -66,6 +68,8 @@ log = logging.getLogger("anketa_bot")
 
 bot = Bot(token=BOT_TOKEN_ANKETA)
 dp = Dispatcher(storage=MemoryStorage())
+
+MODERATOR_IDS_SET = set(MODERATOR_IDS)
 
 BTN_START_ANKETA = "📋 Оставить анкету"
 
@@ -254,7 +258,39 @@ async def get_timezone(message: Message, state: FSMContext):
     username = f"@{message.from_user.username}" if message.from_user.username else "нет username"
 
     app_id = uuid.uuid4().hex[:12]
-    entry = {
+    caption = (
+        f"📋 Новая анкета в клан {CLAN_NAME}\n\n"
+        f"👤 Имя/псевдоним: {data['name']}\n"
+        f"🎂 Возраст: {data['age']}\n"
+        f"⭐ Уровень: {data['level']}\n"
+        f"🌍 Часовой пояс: {data['timezone']}\n"
+        f"🆔 Telegram: {username} (id: {message.from_user.id})"
+    )
+
+    # Рассылаем анкету всем модераторам, запоминаем id их сообщений,
+    # чтобы потом синхронно обновить все копии после решения.
+    moderator_messages = []
+    for mod_id in MODERATOR_IDS:
+        try:
+            sent = await bot.send_photo(
+                chat_id=mod_id,
+                photo=data["skin"],
+                caption=caption,
+                reply_markup=_build_moderator_keyboard(app_id),
+            )
+            moderator_messages.append({"chat_id": mod_id, "message_id": sent.message_id})
+        except Exception:
+            log.exception("Не удалось отправить анкету модератору id=%s", mod_id)
+
+    if not moderator_messages:
+        await message.answer(
+            "⚠️ Не удалось отправить анкету ни одному модератору. Попробуйте позже.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await state.clear()
+        return
+
+    HISTORY[app_id] = {
         "id": app_id,
         "submitted_at": storage.now_iso(),
         "user_id": message.from_user.id,
@@ -265,44 +301,23 @@ async def get_timezone(message: Message, state: FSMContext):
         "timezone": data["timezone"],
         "status": "pending",
         "decided_at": None,
+        "decided_by": None,
+        "caption": caption,
+        "moderator_messages": moderator_messages,
     }
+    _save_history()
 
-    caption = (
-        f"📋 Новая анкета в клан {CLAN_NAME}\n\n"
-        f"👤 Имя/псевдоним: {data['name']}\n"
-        f"🎂 Возраст: {data['age']}\n"
-        f"⭐ Уровень: {data['level']}\n"
-        f"🌍 Часовой пояс: {data['timezone']}\n"
-        f"🆔 Telegram: {username} (id: {message.from_user.id})"
+    await message.answer(
+        f"✅ Ваша анкета отправлена модераторам клана {CLAN_NAME}! Ожидайте решения.",
+        reply_markup=MAIN_KEYBOARD,
     )
-
-    try:
-        await bot.send_photo(
-            chat_id=MODERATOR_ID,
-            photo=data["skin"],
-            caption=caption,
-            reply_markup=_build_moderator_keyboard(app_id),
-        )
-        HISTORY[app_id] = entry
-        _save_history()
-        await message.answer(
-            f"✅ Ваша анкета отправлена модератору клана {CLAN_NAME}! Ожидайте решения.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-    except Exception:
-        log.exception("Не удалось отправить анкету модератору")
-        await message.answer(
-            "⚠️ Не удалось отправить анкету модератору. Попробуйте позже или напишите ему напрямую.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-    finally:
-        await state.clear()
+    await state.clear()
 
 
 @dp.callback_query(F.data.startswith("approve:") | F.data.startswith("decline:"))
 async def handle_decision(callback: CallbackQuery):
-    # Только модератор может принимать решение по анкете.
-    if callback.from_user.id != MODERATOR_ID:
+    # Только модератор из списка может принимать решение по анкете.
+    if callback.from_user.id not in MODERATOR_IDS_SET:
         await callback.answer("У вас нет прав принимать решения по анкетам.", show_alert=True)
         return
 
@@ -314,28 +329,39 @@ async def handle_decision(callback: CallbackQuery):
         return
 
     if application["status"] != "pending":
+        decided_by = application.get("decided_by") or "другим модератором"
         await callback.answer(
-            f"Эта анкета уже обработана ранее ({STATUS_LABEL[application['status']]}).",
+            f"Эта анкета уже обработана ({STATUS_LABEL[application['status']]}, {decided_by}).",
             show_alert=True,
         )
         return
 
     approved = action == "approve"
+    decider_name = callback.from_user.full_name or str(callback.from_user.id)
+
     application["status"] = "approved" if approved else "declined"
     application["decided_at"] = storage.now_iso()
+    application["decided_by"] = decider_name
     _save_history()
 
-    decision_text = "✅ ПРИНЯТА" if approved else "❌ ОТКЛОНЕНА"
+    decision_text = (
+        f"✅ ПРИНЯТА (модератор: {decider_name})"
+        if approved
+        else f"❌ ОТКЛОНЕНА (модератор: {decider_name})"
+    )
+    base_caption = application.get("caption") or callback.message.caption or ""
 
-    # Убираем кнопки и дописываем итог в подпись у модератора.
-    old_caption = callback.message.caption or ""
-    try:
-        await callback.message.edit_caption(
-            caption=f"{old_caption}\n\n— Статус: {decision_text}",
-            reply_markup=None,
-        )
-    except Exception:
-        log.exception("Не удалось отредактировать сообщение модератора")
+    # Обновляем копии сообщения у ВСЕХ модераторов, кому анкета была разослана.
+    for ref in application.get("moderator_messages", []):
+        try:
+            await bot.edit_message_caption(
+                chat_id=ref["chat_id"],
+                message_id=ref["message_id"],
+                caption=f"{base_caption}\n\n— Статус: {decision_text}",
+                reply_markup=None,
+            )
+        except Exception:
+            log.debug("Не удалось обновить копию сообщения у chat_id=%s", ref["chat_id"])
 
     # Уведомляем заявителя.
     try:
@@ -359,7 +385,7 @@ async def handle_decision(callback: CallbackQuery):
 
 @dp.message(Command("history"))
 async def history_cmd(message: Message):
-    if message.from_user.id != MODERATOR_ID:
+    if message.from_user.id not in MODERATOR_IDS_SET:
         await message.answer("⛔ Эта команда доступна только модератору.")
         return
 
@@ -375,8 +401,9 @@ async def history_cmd(message: Message):
     for e in shown:
         emoji = STATUS_EMOJI.get(e["status"], "•")
         submitted = storage.format_ts(e["submitted_at"])
+        who = f", {e['decided_by']}" if e.get("decided_by") else ""
         lines.append(
-            f"{emoji} {submitted} — {e['name']} (ур.{e['level']}, {e['timezone']}) {e['username']}"
+            f"{emoji} {submitted} — {e['name']} (ур.{e['level']}, {e['timezone']}) {e['username']}{who}"
         )
 
     text = "\n".join(lines)
@@ -402,23 +429,27 @@ async def _set_commands():
     ]
     await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
 
-    # /history виден в автодополнении команд только у модератора.
+    # /history виден в автодополнении команд только у модераторов.
     moderator_commands = default_commands + [
         BotCommand(command="history", description="История анкет (модератор)"),
     ]
-    try:
-        await bot.set_my_commands(
-            moderator_commands, scope=BotCommandScopeChat(chat_id=MODERATOR_ID)
-        )
-    except Exception:
-        # Если модератор ещё ни разу не писал боту — Telegram может отказать
-        # в установке команд для его чата. Не критично: команда всё равно
-        # сработает, если её ввести вручную, а меню обновится после его /start.
-        log.warning("Не удалось задать команды для чата модератора (возможно, он ещё не писал боту).")
+    for mod_id in MODERATOR_IDS:
+        try:
+            await bot.set_my_commands(
+                moderator_commands, scope=BotCommandScopeChat(chat_id=mod_id)
+            )
+        except Exception:
+            # Если модератор ещё ни разу не писал боту — Telegram может отказать
+            # в установке команд для его чата. Не критично: команда всё равно
+            # сработает, если её ввести вручную, а меню обновится после его /start.
+            log.warning(
+                "Не удалось задать команды для чата модератора id=%s "
+                "(возможно, он ещё не писал боту).", mod_id
+            )
 
 
 async def main():
-    log.info("Anketa bot запущен")
+    log.info("Anketa bot запущен (модераторов: %d)", len(MODERATOR_IDS))
     await _set_commands()
     await dp.start_polling(bot)
 
