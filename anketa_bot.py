@@ -9,13 +9,20 @@ SILENT REQUIEM — бот приёма анкет в клан.
 5. Часовой пояс (ЧП)
 
 Готовая анкета уходит СРАЗУ ВСЕМ модераторам (MODERATOR_IDS) — каждому
-отдельным сообщением с кнопками «✅ Принять» / «❌ Отклонить». Решение
-принимает тот, кто нажал кнопку первым:
+отдельным сообщением с кнопками «✅ Принять» / «❌ Отклонить» / «🚫 Забанить».
+Решение принимает тот, кто нажал кнопку первым:
 - у всех остальных модераторов их копии сообщения автоматически
   обновляются («уже обработано модератором Х»), повторно нажать нельзя;
 - заявителю приходит уведомление о решении (при одобрении — ссылка на
   чат клана, если задан CLAN_INVITE_LINK);
 - анкета и решение сохраняются в историю (data/anketa_history.json).
+
+Бан пользователей:
+- Кнопка «🚫 Забанить» под анкетой сразу банит автора и отклоняет анкету.
+- Команды /ban <user_id> [причина], /unban <user_id>, /banlist — доступны
+  только модераторам (могут применяться и без готовой анкеты, если знаете id).
+- Забаненный пользователь не может подать новую анкету, пока его не разбанят.
+- Список банов хранится в data/anketa_banned.json (переживает перезапуск).
 
 Команда /history показывает историю всех анкет и доступна ЛЮБОМУ
 модератору из MODERATOR_IDS — остальным бот вежливо откажет. В меню
@@ -29,7 +36,7 @@ UX:
 
 История анкет хранится в JSON-файле на диске (переживает перезапуск
 бота), поэтому даже уже отправленные модераторам анкеты с кнопками
-«Принять/Отклонить» продолжают работать после рестарта бота.
+«Принять/Отклонить/Забанить» продолжают работать после рестарта бота.
 """
 
 import asyncio
@@ -37,7 +44,7 @@ import logging
 import uuid
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, StateFilter, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -82,12 +89,44 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 HISTORY_PATH = storage.data_path("anketa_history.json")
 HISTORY: dict[str, dict] = storage.load_json(HISTORY_PATH, {})
 HISTORY_PAGE_SIZE = 20
-STATUS_EMOJI = {"pending": "⏳", "approved": "✅", "declined": "❌"}
-STATUS_LABEL = {"pending": "на рассмотрении", "approved": "принята", "declined": "отклонена"}
+STATUS_EMOJI = {"pending": "⏳", "approved": "✅", "declined": "❌", "banned": "🚫"}
+STATUS_LABEL = {"pending": "на рассмотрении", "approved": "принята", "declined": "отклонена", "banned": "автор забанен"}
 
 
 def _save_history():
     storage.save_json(HISTORY_PATH, HISTORY)
+
+
+# --- Персистентный список банов ---
+BANNED_PATH = storage.data_path("anketa_banned.json")
+BANNED: dict[str, dict] = storage.load_json(BANNED_PATH, {})
+
+
+def _save_banned():
+    storage.save_json(BANNED_PATH, BANNED)
+
+
+def _is_banned(user_id: int) -> bool:
+    return str(user_id) in BANNED
+
+
+def _ban_user(user_id: int, username: str, banned_by: str, reason: str = ""):
+    BANNED[str(user_id)] = {
+        "user_id": user_id,
+        "username": username,
+        "banned_at": storage.now_iso(),
+        "banned_by": banned_by,
+        "reason": reason or "не указана",
+    }
+    _save_banned()
+
+
+def _unban_user(user_id: int) -> bool:
+    if str(user_id) in BANNED:
+        del BANNED[str(user_id)]
+        _save_banned()
+        return True
+    return False
 
 
 class Anketa(StatesGroup):
@@ -99,6 +138,15 @@ class Anketa(StatesGroup):
 
 
 async def _start_anketa(message: Message, state: FSMContext):
+    if _is_banned(message.from_user.id):
+        await state.clear()
+        await message.answer(
+            "🚫 Вы забанены в этом боте и не можете подавать анкеты.\n"
+            "Если считаете это ошибкой — свяжитесь с модератором клана напрямую.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
     await state.clear()
     await message.answer(
         f"Добро пожаловать в анкету клана {CLAN_NAME}!\n\n"
@@ -112,6 +160,12 @@ async def _start_anketa(message: Message, state: FSMContext):
 @dp.message(Command("start"))
 async def start(message: Message, state: FSMContext):
     await state.clear()
+    if _is_banned(message.from_user.id):
+        await message.answer(
+            "🚫 Вы забанены в этом боте и не можете подавать анкеты.\n"
+            "Если считаете это ошибкой — свяжитесь с модератором клана напрямую."
+        )
+        return
     await message.answer(
         f"Привет! Это бот приёма анкет в клан {CLAN_NAME}.\n\n"
         f"Нажмите кнопку ниже, чтобы подать анкету.",
@@ -138,6 +192,86 @@ async def cancel(message: Message, state: FSMContext):
 @dp.message(StateFilter("*"), F.text == BTN_START_ANKETA)
 async def start_anketa_button(message: Message, state: FSMContext):
     await _start_anketa(message, state)
+
+
+# --- Команды модерации: /ban, /unban, /banlist ---
+
+@dp.message(Command("ban"))
+async def ban_cmd(message: Message, command: CommandObject):
+    if message.from_user.id not in MODERATOR_IDS_SET:
+        await message.answer("⛔ Эта команда доступна только модератору.")
+        return
+
+    if not command.args:
+        await message.answer("Использование: /ban <user_id> [причина]\nНапример: /ban 123456789 спам")
+        return
+
+    parts = command.args.split(maxsplit=1)
+    target_id_str = parts[0]
+    reason = parts[1] if len(parts) > 1 else ""
+
+    if not target_id_str.isdigit():
+        await message.answer("user_id должен быть числом. Использование: /ban <user_id> [причина]")
+        return
+
+    target_id = int(target_id_str)
+    banned_by = message.from_user.full_name or str(message.from_user.id)
+    _ban_user(target_id, username="", banned_by=banned_by, reason=reason)
+
+    try:
+        await bot.send_message(
+            chat_id=target_id,
+            text="🚫 Вы были забанены в боте анкет клана SILENT REQUIEM и больше не можете подавать анкеты.",
+        )
+    except Exception:
+        log.warning("Не удалось уведомить пользователя id=%s о бане", target_id)
+
+    await message.answer(f"✅ Пользователь {target_id} забанен." + (f"\nПричина: {reason}" if reason else ""))
+
+
+@dp.message(Command("unban"))
+async def unban_cmd(message: Message, command: CommandObject):
+    if message.from_user.id not in MODERATOR_IDS_SET:
+        await message.answer("⛔ Эта команда доступна только модератору.")
+        return
+
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Использование: /unban <user_id>")
+        return
+
+    target_id = int(command.args.strip())
+    if _unban_user(target_id):
+        await message.answer(f"✅ Пользователь {target_id} разбанен.")
+        try:
+            await bot.send_message(
+                chat_id=target_id,
+                text="✅ Вы разбанены и снова можете подавать анкеты в клан SILENT REQUIEM.",
+            )
+        except Exception:
+            pass
+    else:
+        await message.answer(f"Пользователь {target_id} не найден в списке забаненных.")
+
+
+@dp.message(Command("banlist"))
+async def banlist_cmd(message: Message):
+    if message.from_user.id not in MODERATOR_IDS_SET:
+        await message.answer("⛔ Эта команда доступна только модератору.")
+        return
+
+    if not BANNED:
+        await message.answer("Список банов пуст.")
+        return
+
+    lines = [f"🚫 Забаненные пользователи ({len(BANNED)}):\n"]
+    for entry in sorted(BANNED.values(), key=lambda e: e["banned_at"], reverse=True):
+        ts = storage.format_ts(entry["banned_at"])
+        name = f" ({entry['username']})" if entry.get("username") else ""
+        lines.append(f"• {entry['user_id']}{name} — {ts}, причина: {entry['reason']}")
+
+    text = "\n".join(lines)
+    for chunk_start in range(0, len(text), 3500):
+        await message.answer(text[chunk_start:chunk_start + 3500])
 
 
 @dp.message(Anketa.name)
@@ -237,13 +371,24 @@ def _build_moderator_keyboard(app_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="✅ Принять", callback_data=f"approve:{app_id}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decline:{app_id}"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="🚫 Забанить автора", callback_data=f"banuser:{app_id}"),
+            ],
         ]
     )
 
 
 @dp.message(Anketa.timezone)
 async def get_timezone(message: Message, state: FSMContext):
+    if _is_banned(message.from_user.id):
+        await message.answer(
+            "🚫 Вы забанены в этом боте и не можете подавать анкеты.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await state.clear()
+        return
+
     timezone = (message.text or "").strip()
     if not timezone:
         await message.answer("Укажите часовой пояс текстом, например: UTC+3")
@@ -314,9 +459,22 @@ async def get_timezone(message: Message, state: FSMContext):
     await state.clear()
 
 
+async def _update_moderator_copies(application: dict, decision_text: str):
+    base_caption = application.get("caption") or ""
+    for ref in application.get("moderator_messages", []):
+        try:
+            await bot.edit_message_caption(
+                chat_id=ref["chat_id"],
+                message_id=ref["message_id"],
+                caption=f"{base_caption}\n\n— Статус: {decision_text}",
+                reply_markup=None,
+            )
+        except Exception:
+            log.debug("Не удалось обновить копию сообщения у chat_id=%s", ref["chat_id"])
+
+
 @dp.callback_query(F.data.startswith("approve:") | F.data.startswith("decline:"))
 async def handle_decision(callback: CallbackQuery):
-    # Только модератор из списка может принимать решение по анкете.
     if callback.from_user.id not in MODERATOR_IDS_SET:
         await callback.answer("У вас нет прав принимать решения по анкетам.", show_alert=True)
         return
@@ -349,19 +507,7 @@ async def handle_decision(callback: CallbackQuery):
         if approved
         else f"❌ ОТКЛОНЕНА (модератор: {decider_name})"
     )
-    base_caption = application.get("caption") or callback.message.caption or ""
-
-    # Обновляем копии сообщения у ВСЕХ модераторов, кому анкета была разослана.
-    for ref in application.get("moderator_messages", []):
-        try:
-            await bot.edit_message_caption(
-                chat_id=ref["chat_id"],
-                message_id=ref["message_id"],
-                caption=f"{base_caption}\n\n— Статус: {decision_text}",
-                reply_markup=None,
-            )
-        except Exception:
-            log.debug("Не удалось обновить копию сообщения у chat_id=%s", ref["chat_id"])
+    await _update_moderator_copies(application, decision_text)
 
     # Уведомляем заявителя.
     try:
@@ -381,6 +527,48 @@ async def handle_decision(callback: CallbackQuery):
         log.exception("Не удалось уведомить заявителя о решении")
 
     await callback.answer("Решение сохранено." if approved else "Анкета отклонена.")
+
+
+@dp.callback_query(F.data.startswith("banuser:"))
+async def handle_ban_from_anketa(callback: CallbackQuery):
+    if callback.from_user.id not in MODERATOR_IDS_SET:
+        await callback.answer("У вас нет прав банить пользователей.", show_alert=True)
+        return
+
+    _, app_id = callback.data.split(":", 1)
+    application = HISTORY.get(app_id)
+
+    if application is None:
+        await callback.answer("Анкета не найдена в истории.", show_alert=True)
+        return
+
+    decider_name = callback.from_user.full_name or str(callback.from_user.id)
+    target_id = application["user_id"]
+
+    _ban_user(target_id, username=application.get("username", ""), banned_by=decider_name, reason="через анкету")
+
+    if application["status"] == "pending":
+        application["status"] = "banned"
+        application["decided_at"] = storage.now_iso()
+        application["decided_by"] = decider_name
+        _save_history()
+        decision_text = f"🚫 АВТОР ЗАБАНЕН (модератор: {decider_name})"
+        await _update_moderator_copies(application, decision_text)
+    else:
+        await callback.answer(
+            f"Пользователь {target_id} забанен (анкета уже была обработана ранее).",
+            show_alert=True,
+        )
+
+    try:
+        await bot.send_message(
+            chat_id=target_id,
+            text=f"🚫 Вы были забанены в боте анкет клана {CLAN_NAME} и больше не можете подавать анкеты.",
+        )
+    except Exception:
+        log.warning("Не удалось уведомить пользователя id=%s о бане", target_id)
+
+    await callback.answer(f"Пользователь {target_id} забанен.")
 
 
 @dp.message(Command("history"))
@@ -407,7 +595,6 @@ async def history_cmd(message: Message):
         )
 
     text = "\n".join(lines)
-    # Telegram лимит на сообщение ~4096 символов — режем на части при необходимости.
     for chunk_start in range(0, len(text), 3500):
         await message.answer(text[chunk_start:chunk_start + 3500])
 
@@ -416,6 +603,9 @@ async def history_cmd(message: Message):
 # состояния и это не команда/кнопка).
 @dp.message(StateFilter(None))
 async def fallback(message: Message):
+    if _is_banned(message.from_user.id):
+        await message.answer("🚫 Вы забанены в этом боте и не можете подавать анкеты.")
+        return
     await message.answer(
         "Нажмите кнопку ниже, чтобы подать анкету, либо используйте /start.",
         reply_markup=MAIN_KEYBOARD,
@@ -429,9 +619,12 @@ async def _set_commands():
     ]
     await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
 
-    # /history виден в автодополнении команд только у модераторов.
+    # Расширенное меню видно в автодополнении команд только у модераторов.
     moderator_commands = default_commands + [
         BotCommand(command="history", description="История анкет (модератор)"),
+        BotCommand(command="ban", description="Забанить пользователя (модератор)"),
+        BotCommand(command="unban", description="Разбанить пользователя (модератор)"),
+        BotCommand(command="banlist", description="Список забаненных (модератор)"),
     ]
     for mod_id in MODERATOR_IDS:
         try:
@@ -439,9 +632,6 @@ async def _set_commands():
                 moderator_commands, scope=BotCommandScopeChat(chat_id=mod_id)
             )
         except Exception:
-            # Если модератор ещё ни разу не писал боту — Telegram может отказать
-            # в установке команд для его чата. Не критично: команда всё равно
-            # сработает, если её ввести вручную, а меню обновится после его /start.
             log.warning(
                 "Не удалось задать команды для чата модератора id=%s "
                 "(возможно, он ещё не писал боту).", mod_id
