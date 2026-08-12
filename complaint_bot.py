@@ -4,12 +4,12 @@ SILENT REQUIEM — бот приёма жалоб.
 Сценарий:
 1. Пользователь описывает суть жалобы текстом.
 2. Опционально прикладывает доказательство (фото/скриншот).
-3. Жалоба уходит модератору (MODERATOR_ID_COMPLAINTS) и сохраняется в
-   историю (data/complaints_history.json).
+3. Жалоба уходит СРАЗУ ВСЕМ модераторам (MODERATOR_IDS_COMPLAINTS) и
+   сохраняется в историю (data/complaints_history.json).
 
-Команда /history показывает историю всех жалоб и доступна ТОЛЬКО
-модератору (MODERATOR_ID_COMPLAINTS) — остальным бот вежливо откажет.
-В меню команд Telegram эта команда видна только в чате с модератором.
+Команда /history показывает историю всех жалоб и доступна ЛЮБОМУ
+модератору из MODERATOR_IDS_COMPLAINTS — остальным бот вежливо откажет.
+В меню команд Telegram эта команда видна только в чатах с модераторами.
 
 UX:
 - Внизу экрана постоянная reply-клавиатура с кнопкой «⚠️ Оставить жалобу».
@@ -37,13 +37,15 @@ from aiogram.types import (
 )
 
 import storage
-from config import BOT_TOKEN_COMPLAINTS, MODERATOR_ID_COMPLAINTS, CLAN_NAME
+from config import BOT_TOKEN_COMPLAINTS, MODERATOR_IDS_COMPLAINTS, CLAN_NAME
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("complaint_bot")
 
 bot = Bot(token=BOT_TOKEN_COMPLAINTS)
 dp = Dispatcher(storage=MemoryStorage())
+
+MODERATOR_IDS_SET = set(MODERATOR_IDS_COMPLAINTS)
 
 BTN_START_COMPLAINT = "⚠️ Оставить жалобу"
 
@@ -132,6 +134,21 @@ def _build_header(message: Message) -> str:
     return f"🆔 От: {username} (id: {message.from_user.id})"
 
 
+async def _broadcast_to_moderators(caption: str, photo_file_id):
+    """Рассылает жалобу всем модераторам. Возвращает число успешных отправок."""
+    sent_count = 0
+    for mod_id in MODERATOR_IDS_COMPLAINTS:
+        try:
+            if photo_file_id:
+                await bot.send_photo(chat_id=mod_id, photo=photo_file_id, caption=caption)
+            else:
+                await bot.send_message(chat_id=mod_id, text=caption)
+            sent_count += 1
+        except Exception:
+            log.exception("Не удалось отправить жалобу модератору id=%s", mod_id)
+    return sent_count
+
+
 def _save_complaint_entry(message: Message, text: str, proof: str):
     entry = {
         "id": uuid.uuid4().hex[:12],
@@ -153,21 +170,15 @@ async def get_proof_photo(message: Message, state: FSMContext):
         f"📝 Текст: {data['text']}\n"
         f"{_build_header(message)}"
     )
-    try:
-        await bot.send_photo(
-            chat_id=MODERATOR_ID_COMPLAINTS,
-            photo=message.photo[-1].file_id,
-            caption=caption,
-        )
+    sent_count = await _broadcast_to_moderators(caption, message.photo[-1].file_id)
+    if sent_count:
         _save_complaint_entry(message, data["text"], "фото приложено")
-        await message.answer("✅ Жалоба отправлена модератору.", reply_markup=MAIN_KEYBOARD)
-    except Exception:
-        log.exception("Не удалось отправить жалобу модератору")
+        await message.answer("✅ Жалоба отправлена модератору(ам).", reply_markup=MAIN_KEYBOARD)
+    else:
         await message.answer(
             "⚠️ Не удалось отправить жалобу. Попробуйте позже.", reply_markup=MAIN_KEYBOARD
         )
-    finally:
-        await state.clear()
+    await state.clear()
 
 
 @dp.message(Complaint.proof, F.document)
@@ -181,21 +192,15 @@ async def get_proof_document(message: Message, state: FSMContext):
             f"📝 Текст: {data['text']}\n"
             f"{_build_header(message)}"
         )
-        try:
-            await bot.send_photo(
-                chat_id=MODERATOR_ID_COMPLAINTS,
-                photo=message.document.file_id,
-                caption=caption,
-            )
+        sent_count = await _broadcast_to_moderators(caption, message.document.file_id)
+        if sent_count:
             _save_complaint_entry(message, data["text"], "файл-изображение приложен")
-            await message.answer("✅ Жалоба отправлена модератору.", reply_markup=MAIN_KEYBOARD)
-        except Exception:
-            log.exception("Не удалось отправить жалобу модератору")
+            await message.answer("✅ Жалоба отправлена модератору(ам).", reply_markup=MAIN_KEYBOARD)
+        else:
             await message.answer(
                 "⚠️ Не удалось отправить жалобу. Попробуйте позже.", reply_markup=MAIN_KEYBOARD
             )
-        finally:
-            await state.clear()
+        await state.clear()
         return
 
     await message.answer(
@@ -218,22 +223,20 @@ async def get_proof_text(message: Message, state: FSMContext):
         f"📎 Доказательства: {proof_text}\n"
         f"{_build_header(message)}"
     )
-    try:
-        await bot.send_message(chat_id=MODERATOR_ID_COMPLAINTS, text=caption)
+    sent_count = await _broadcast_to_moderators(caption, None)
+    if sent_count:
         _save_complaint_entry(message, data["text"], proof_text)
-        await message.answer("✅ Жалоба отправлена модератору.", reply_markup=MAIN_KEYBOARD)
-    except Exception:
-        log.exception("Не удалось отправить жалобу модератору")
+        await message.answer("✅ Жалоба отправлена модератору(ам).", reply_markup=MAIN_KEYBOARD)
+    else:
         await message.answer(
             "⚠️ Не удалось отправить жалобу. Попробуйте позже.", reply_markup=MAIN_KEYBOARD
         )
-    finally:
-        await state.clear()
+    await state.clear()
 
 
 @dp.message(Command("history"))
 async def history_cmd(message: Message):
-    if message.from_user.id != MODERATOR_ID_COMPLAINTS:
+    if message.from_user.id not in MODERATOR_IDS_SET:
         await message.answer("⛔ Эта команда доступна только модератору.")
         return
 
@@ -278,20 +281,24 @@ async def _set_commands():
     ]
     await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
 
-    # /history виден в автодополнении команд только у модератора.
+    # /history виден в автодополнении команд только у модераторов.
     moderator_commands = default_commands + [
         BotCommand(command="history", description="История жалоб (модератор)"),
     ]
-    try:
-        await bot.set_my_commands(
-            moderator_commands, scope=BotCommandScopeChat(chat_id=MODERATOR_ID_COMPLAINTS)
-        )
-    except Exception:
-        log.warning("Не удалось задать команды для чата модератора (возможно, он ещё не писал боту).")
+    for mod_id in MODERATOR_IDS_COMPLAINTS:
+        try:
+            await bot.set_my_commands(
+                moderator_commands, scope=BotCommandScopeChat(chat_id=mod_id)
+            )
+        except Exception:
+            log.warning(
+                "Не удалось задать команды для чата модератора id=%s "
+                "(возможно, он ещё не писал боту).", mod_id
+            )
 
 
 async def main():
-    log.info("Complaint bot запущен")
+    log.info("Complaint bot запущен (модераторов: %d)", len(MODERATOR_IDS_COMPLAINTS))
     await _set_commands()
     await dp.start_polling(bot)
 
